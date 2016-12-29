@@ -2,5 +2,5 @@ all: clean
 	@python3 setup.py
 
 clean:
-	@rm -f *.conf *.toml *.pyc *.log *.rdb
-	@rm -f *.etcd -r
+	@rm -rf *.conf *.toml *.pyc *.log *.rdb
+	@rm -rf *.etcd -r

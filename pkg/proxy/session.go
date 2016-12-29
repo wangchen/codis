@@ -6,16 +6,15 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
-	"net"
-	"strconv"
-	"sync"
-	"time"
-
 	"github.com/CodisLabs/codis/pkg/models"
 	"github.com/CodisLabs/codis/pkg/proxy/redis"
 	"github.com/CodisLabs/codis/pkg/utils/errors"
 	"github.com/CodisLabs/codis/pkg/utils/log"
 	"github.com/CodisLabs/codis/pkg/utils/sync2/atomic2"
+	"net"
+	"strconv"
+	"sync"
+	"time"
 )
 
 type Session struct {
@@ -43,6 +42,10 @@ type Session struct {
 	config *Config
 
 	authorized bool
+
+	// 0 - none, 1 - just open, 2 - in transaction
+	transactionStatus int
+	transactionResps  []*redis.Resp
 }
 
 func (s *Session) String() string {
@@ -72,6 +75,8 @@ func NewSession(sock net.Conn, config *Config) *Session {
 		Conn: c, config: config,
 		CreateUnix: time.Now().Unix(),
 	}
+	s.transactionStatus = 0
+	s.transactionResps = make([]*redis.Resp, 0)
 	s.stats.opmap = make(map[string]*opStats, 16)
 	log.Infof("session [%p] create: %s", s, s)
 	return s
@@ -106,6 +111,7 @@ var (
 )
 
 var RespOK = redis.NewString([]byte("OK"))
+var RespNotAllowed = redis.NewString([]byte("Not allowed"))
 
 func (s *Session) Start(d *Router) {
 	s.start.Do(func() {
@@ -192,6 +198,11 @@ func (s *Session) loopWriter(tasks <-chan *Request) (err error) {
 	p.MaxBuffered = 256
 
 	for r := range tasks {
+		if r.OpStr == "EXEC" {
+			r.Resp = redis.NewArray(s.transactionResps)
+			s.transactionStatus = 0
+			s.transactionResps = make([]*redis.Resp, 0)
+		}
 		resp, err := s.handleResponse(r)
 		if err != nil {
 			resp = redis.NewErrorf("ERR handle response, %s", err)
@@ -210,6 +221,13 @@ func (s *Session) loopWriter(tasks <-chan *Request) (err error) {
 		}
 		if len(tasks) == 0 {
 			s.flushOpStats(false)
+		}
+		switch s.transactionStatus {
+		case 1:
+			// MULTI was executed
+			s.transactionStatus = 2
+		case 2:
+			s.transactionResps = append(s.transactionResps, resp)
 		}
 	}
 	return nil
@@ -239,8 +257,13 @@ func (s *Session) handleRequest(r *Request, d *Router) error {
 	r.OpFlag = flag
 	r.Broken = &s.broken
 
+	if opstr == "MULTI" {
+		s.transactionStatus = 1
+	}
+
 	if flag.IsNotAllowed() {
-		return fmt.Errorf("command '%s' is not allowed", opstr)
+		r.Resp = RespNotAllowed
+		return nil
 	}
 
 	switch opstr {
